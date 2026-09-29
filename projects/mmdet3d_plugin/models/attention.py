@@ -1,8 +1,10 @@
 import warnings
 import math
 
+import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.functional import linear
 from torch.nn.init import xavier_uniform_, constant_
 
@@ -15,13 +17,104 @@ import torch.utils.checkpoint as cp
 
 
 from einops import rearrange
+
 try:
     from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
     print('Use flash_attn_unpadded_kvpacked_func')
-except:
-    from flash_attn.flash_attn_interface import  flash_attn_varlen_kvpacked_func as flash_attn_unpadded_kvpacked_func
-    print('Use flash_attn_varlen_kvpacked_func')
-from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
+except ImportError:
+    try:
+        from flash_attn.flash_attn_interface import  flash_attn_varlen_kvpacked_func as flash_attn_unpadded_kvpacked_func
+        print('Use flash_attn_varlen_kvpacked_func')
+    except ImportError:
+        flash_attn_unpadded_kvpacked_func = None
+
+try:
+    from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
+except ImportError:
+    # flash_attn is not installed. Turing (sm_75) and older GPUs, for instance,
+    # are not supported by flash-attn 2.x, so provide native PyTorch
+    # replacements that keep the same interface and the same numerics.
+
+    def index_first_axis(x, indices):
+        """Replacement of ``flash_attn.bert_padding.index_first_axis``."""
+        return x.index_select(0, indices)
+
+    def unpad_input(hidden_states, attention_mask):
+        """Replacement of ``flash_attn.bert_padding.unpad_input``.
+
+        ``attention_mask`` follows flash_attn's convention: True (or 1) marks a
+        token to keep, False (or 0) a padded one. Returns, in this order, the
+        packed hidden states, the indices of the kept tokens, the cumulative
+        sequence lengths and the length of the longest sequence.
+        """
+        seqlens = attention_mask.sum(dim=-1, dtype=torch.int32)
+        indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+        max_seqlen = int(seqlens.max().item())
+        cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
+        hidden_states = index_first_axis(
+            rearrange(hidden_states, 'b s ... -> (b s) ...'), indices
+        )
+        return hidden_states, indices, cu_seqlens, max_seqlen
+
+    def pad_input(hidden_states, indices, batch, seqlen):
+        """Replacement of ``flash_attn.bert_padding.pad_input``."""
+        output = hidden_states.new_zeros(batch * seqlen, *hidden_states.shape[1:])
+        output[indices] = hidden_states
+        return rearrange(output, '(b s) ... -> b s ...', b=batch)
+
+    # Number of queries attended at once. The score matrix of a chunk has shape
+    # (heads, chunk, seqlen_k), so lowering this value lowers the peak memory.
+    # This matters on GPUs with little VRAM, hence the environment override.
+    NATIVE_ATTN_CHUNK = int(os.getenv('SPARSEDRIVE_NATIVE_ATTN_CHUNK', '256'))
+
+    def _native_varlen_kvpacked_func(
+        q, kv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+        dropout_p=0.0, softmax_scale=None, causal=False, **kwargs
+    ):
+        """Replacement of ``flash_attn_varlen_kvpacked_func``.
+
+        ``q`` has shape (total_q, heads, head_dim) and ``kv`` (total_k, 2,
+        heads, head_dim). The returned tensor has shape (total_q, heads,
+        head_dim). Sequences are processed one by one and the scores are
+        computed in float32, which is slower than flash_attn but exact.
+        """
+        nheads, headdim = q.shape[-2], q.shape[-1]
+        scale = headdim ** -0.5 if softmax_scale is None else softmax_scale
+        outputs = []
+        for i in range(cu_seqlens_q.numel() - 1):
+            q_start, q_end = int(cu_seqlens_q[i]), int(cu_seqlens_q[i + 1])
+            k_start, k_end = int(cu_seqlens_k[i]), int(cu_seqlens_k[i + 1])
+            if q_end <= q_start:
+                continue
+            if k_end <= k_start:
+                # Nothing to attend to; flash_attn leaves those rows at zero.
+                outputs.append(q.new_zeros(q_end - q_start, nheads, headdim))
+                continue
+            qi = q[q_start:q_end].transpose(0, 1).float()
+            ki = kv[k_start:k_end, 0].transpose(0, 1).float()
+            vi = kv[k_start:k_end, 1].transpose(0, 1).float()
+            pooled = []
+            for start in range(0, qi.shape[1], NATIVE_ATTN_CHUNK):
+                end = min(start + NATIVE_ATTN_CHUNK, qi.shape[1])
+                scores = torch.matmul(
+                    qi[:, start:end], ki.transpose(-1, -2)
+                ) * scale
+                if causal:
+                    rows = torch.arange(start, end, device=scores.device)[:, None]
+                    cols = torch.arange(ki.shape[1], device=scores.device)[None, :]
+                    scores = scores.masked_fill(cols > rows, float('-inf'))
+                attn = torch.softmax(scores, dim=-1)
+                if dropout_p > 0.0:
+                    attn = F.dropout(attn, p=dropout_p)
+                pooled.append(torch.matmul(attn, vi))
+            outputs.append(torch.cat(pooled, dim=1).transpose(0, 1).to(q.dtype))
+        if not outputs:
+            return q.new_zeros(0, nheads, headdim)
+        return torch.cat(outputs, dim=0)
+
+    if flash_attn_unpadded_kvpacked_func is None:
+        flash_attn_unpadded_kvpacked_func = _native_varlen_kvpacked_func
+        print('flash_attn is not available, use the native PyTorch attention')
 
 
 def _in_projection_packed(q, k, v, w, b = None):
